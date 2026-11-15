@@ -1,0 +1,395 @@
+/* LawChange 디자인 시스템 제4판 — 조각 시스템 (C안)
+ *
+ * 핵심 은유: 법령은 문서 한 장이 아니라 **독립적인 조문 조각들의 구조체**다.
+ * 변경된 조각이 조직의 업무로 이어진다. 이 구조가 화면의 시각 언어가 된다.
+ *
+ * 제3판(중립 웹앱)과의 차이
+ *   · 제3판은 명조와 올리브를 폐기했다. 제4판은 둘 다 되살리되 **역할을 준다**.
+ *     명조는 "법령의 목소리"(법문·법령명·조문), 고딕은 "도구의 목소리"(내비·버튼·표).
+ *     장식이 아니라 무엇이 법이고 무엇이 도구인지를 구분하는 장치다.
+ *   · 중립 회색 캔버스 → 따뜻한 종이(#F7F7F0). 인디고 → 올리브.
+ *   · radius 6~12 → 0~6. 카드가 아니라 블록으로 읽히게.
+ *
+ * 원칙
+ *   1. 정보 위계 → 타이포 → 여백 → 레이아웃 → 상태 → 색 → 장식.
+ *   2. 4 변경타입은 색만으로 구분하지 않는다. 기호 + 형태 단서를 항상 함께.
+ *   3. 그림자로 띄우지 않는다. 층은 선과 바탕 톤으로.
+ *   4. 조각 모티프(큐브)는 랜딩·로고·빈 상태에만. 실무 화면은 블록 리듬으로 잇는다.
+ */
+
+/* 두 목소리. Pretendard = 도구 / 나눔명조 = 법령. 한 줄 안에서 섞지 않는다.
+ * 명조는 next/font (layout.tsx) 로 self-host 한다 — CSS @import 는 URL 의
+ * 세미콜론 때문에 잘려서 요청 자체가 안 나간다. */
+@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─────────────────────────────────────────────────────────────
+ * 토큰
+ * 모든 색은 semantic 이름으로만 노출한다. 컴포넌트에서 raw hex 금지.
+ * 라이트 = :root, 다크 = .dark (html class 로 스위칭).
+ * ───────────────────────────────────────────────────────────── */
+:root {
+  /* Surface — 따뜻한 종이. 순백을 쓰지 않는다. */
+  --canvas: 247 247 240;          /* #F7F7F0 앱 바탕 */
+  --surface: 252 252 248;         /* #FCFCF8 블록 면 */
+  --subtle: 243 243 235;          /* #F3F3EB 아주 옅은 구분 */
+  --hover: 239 239 230;           /* #EFEFE6 행 hover */
+  --selected: 238 241 232;        /* #EEF1E8 선택 상태 = olive subtle */
+
+  /* Foreground */
+  --fg: 26 26 26;                 /* #1A1A1A 본문·제목 · canvas 16.2:1 */
+  --fg-secondary: 85 88 79;       /* #55584F 보조 · 6.7:1 */
+  --fg-muted: 102 104 95;        /* #66685F 메타 · canvas 5.26 / hover 4.89 */
+  --fg-disabled: 165 166 157;     /* #A5A69D 비활성 (대비 기준 면제) */
+
+  /* Line */
+  --line: 222 220 210;            /* #DEDCD2 */
+  --line-strong: 201 198 186;     /* #C9C6BA */
+
+  /* Primary — 올리브. 선택·주요 action. */
+  --primary: 86 104 76;           /* #56684C 면 · 흰 글자 6.0:1 */
+  --primary-hover: 71 87 63;      /* #47573F */
+  --primary-active: 63 81 56;     /* #3F5138 */
+  --primary-subtle: 238 241 232;  /* #EEF1E8 */
+  --primary-fg: 252 252 248;      /* olive 면 위 글자 */
+  --primary-text: 63 81 56;       /* #3F5138 바탕 위 텍스트 · 8.0:1 */
+
+  /* Semantic — 면/마커용과 텍스트용을 분리한다.
+   * C안이 준 amber(#D08A00)·added(#4C8A5B) 는 라이트에서 텍스트로 쓰면
+   * 각각 2.67:1 · 3.83:1 로 AA 미달이다. 마커·테두리로는 그대로 쓰고
+   * 글자에는 어둡게 파생한 -text 를 쓴다. */
+  /* ── 서명 색면 ────────────────────────────────────────────────
+   * 화면당 딱 한 곳에만 쓰는 짙은 면. 외부 평가에서 "포인트 컬러가 거의
+   * 없다 · 심심하다" 가 세 번 반복됐는데, 같은 평가자들이 디자인에는
+   * 6축 중 최고점을 줬다 — 망가진 게 아니라 기억에 안 남는다는 뜻이다.
+   *
+   * 색을 새로 늘리지 않고 올리브를 깊게 눌러 쓴다. 4가지 변경 유형이
+   * 이미 색 예산을 다 쓰고 있어서, 브랜드 색을 늘리면 그 신호가 묻힌다.
+   * 대신 면적을 다르게 한다 — 변경 신호는 배지·좌측 라인 같은 작은 면적,
+   * 서명 색면은 큰 면적이라 눈이 다른 층위로 읽는다.
+   *
+   * 조건: 각지게 · 그림자 없이 · 1px 격자 유지.
+   * 짙은 색면은 공공기관 헤더로 미끄러지기 쉽고, 제4판이 정확히 피하려던
+   * 인상이다. 둥글리거나 그림자를 붙이는 순간 그쪽으로 간다.
+   */
+  --signature: 46 56 40;          /* #2E3828 면 */
+  --signature-line: 59 72 52;     /* #3B4834 면 안의 1px 격자 */
+  --signature-fg: 251 252 247;    /* #FBFCF7 숫자 · 11.9:1 */
+  --signature-label: 182 191 174; /* #B6BFAE 라벨 · 6.5:1 */
+  --signature-muted: 151 163 142; /* #97A38E 힌트 · 4.6:1 */
+  --signature-accent: 240 201 122;/* #F0C97A 주의가 필요한 숫자 · 7.8:1 */
+
+  --success: 46 96 57;            /* #2E6039 텍스트 6.9:1 */
+  --success-subtle: 233 240 233;  /* #E9F0E9 */
+  --warning: 122 82 0;            /* #7A5200 텍스트 6.4:1 */
+  --warning-subtle: 250 240 220;  /* #FAF0DC */
+  --danger: 163 58 41;            /* #A33A29 텍스트 6.1:1 */
+  --danger-subtle: 250 235 231;   /* #FAEBE7 */
+  --info: 59 78 110;              /* #3B4E6E 텍스트 7.8:1 */
+  --info-subtle: 232 236 243;     /* #E8ECF3 */
+
+  /* 브랜드 액센트 — 마커·테두리·일러스트용. 본문 글자로 쓰지 않는다. */
+  --amber: 208 138 0;             /* #D08A00 */
+  --terracotta: 194 79 60;        /* #C24F3C */
+
+  /* 4 변경타입.
+   * mark = 글리프·좌측 바·테두리 (비텍스트 3:1 기준)
+   * text = 글자 (AA 4.5:1 이상)
+   * panel = 블록 배경 */
+  --change-added-mark: 76 138 91;      /* #4C8A5B */
+  --change-added-text: 46 96 57;       /* #2E6039 · subtle 위 6.4:1 */
+  --change-added-panel: 233 240 233;   /* #E9F0E9 */
+  --change-modified-mark: 208 138 0;   /* #D08A00 */
+  --change-modified-text: 122 82 0;    /* #7A5200 · 6.1:1 */
+  --change-modified-panel: 250 240 220;/* #FAF0DC */
+  /* 삭제는 4종 중 유일하게 무채색이라 색 신호가 없었다. "죽은 조문" 이라는
+   * 톤은 유지하되(채도 낮게) 붉은 기를 넣어 나머지 셋과 구분되게 한다. */
+  --change-deleted-mark: 158 122 116;  /* #9E7A74 */
+  --change-deleted-text: 122 74 66;    /* #7A4A42 · panel 위 5.9:1 */
+  --change-deleted-panel: 245 236 234; /* #F5ECEA */
+  --change-moved-mark: 92 113 149;     /* #5C7195 */
+  --change-moved-text: 59 78 110;      /* #3B4E6E · 7.1:1 */
+  --change-moved-panel: 232 236 243;   /* #E8ECF3 */
+
+  /* 두 목소리. 컴포넌트는 font-legal / font-sans 로만 참조한다. */
+  --font-legal: var(--font-nanum-myeongjo), "Nanum Myeongjo", "Noto Serif KR",
+    ui-serif, Georgia, serif;
+
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%236C6E65' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+}
+.dark {
+  /* 검은 종이가 아니라, 어둠 속에서도 조문 블록 구조가 선명한 것이 목표.
+   * pure black · pure white 를 쓰지 않는다. */
+  --canvas: 17 19 22;             /* #111316 */
+  --surface: 23 26 28;            /* #171A1C */
+  --subtle: 28 32 33;             /* #1C2021 raised */
+  --hover: 32 35 37;              /* #202325 */
+  --selected: 37 45 35;           /* #252D23 olive subtle */
+
+  --fg: 240 238 232;              /* #F0EEE8 warm off-white · 16.0:1 */
+  --fg-secondary: 185 187 180;    /* #B9BBB4 · 9.6:1 */
+  --fg-muted: 140 142 135;        /* #8C8E87 · 5.6:1 */
+  --fg-disabled: 95 98 94;        /* #5F625E (면제) */
+
+  --line: 48 53 55;               /* #303537 */
+  --line-strong: 68 74 75;        /* #444A4B */
+
+  /* 면으로 쓰는 올리브는 흰 글자 대비를 유지해야 해서 라이트와 같은 톤을
+   * 쓰고, 바탕 위 텍스트만 밝게 flip 한다. */
+  --primary: 92 112 81;           /* #5C7051 */
+  --primary-hover: 107 128 95;    /* #6B805F */
+  --primary-active: 86 104 76;    /* #56684C */
+  --primary-subtle: 37 45 35;     /* #252D23 */
+  --primary-fg: 245 245 238;
+  --primary-text: 154 173 138;    /* #9AAD8A · dark canvas 8.2:1 */
+
+  /* 서명 색면 — 다크에서는 캔버스(#111316)보다 밝아야 "얹힌 면" 으로 읽힌다.
+   * 라이트와 같은 값을 쓰면 캔버스 대비 1.52 로, 현재 surface(약 1.2)보다
+   * 오히려 뚜렷하다. 텍스트 대비는 라이트와 동일하다. */
+  --signature: 46 56 40;
+  --signature-line: 62 76 55;
+  --signature-fg: 242 242 236;
+  --signature-label: 182 191 174;
+  --signature-muted: 151 163 142;
+  --signature-accent: 232 201 138;
+
+  --success: 155 201 166;         /* #9BC9A6 · 10.0:1 */
+  --success-subtle: 27 42 30;     /* #1B2A1E */
+  --warning: 232 190 92;          /* #E8BE5C · 10.6:1 */
+  --warning-subtle: 44 36 16;     /* #2C2410 */
+  --danger: 238 138 109;          /* #EE8A6D · 7.5:1 */
+  --danger-subtle: 51 27 21;      /* #331B15 */
+  --info: 168 187 216;            /* #A8BBD8 · 9.5:1 */
+  --info-subtle: 27 34 48;        /* #1B2230 */
+
+  --amber: 225 160 0;             /* #E1A000 */
+  --terracotta: 224 106 74;       /* #E06A4A */
+
+  /* 4 변경타입 — 다크에서 서로 구분되도록 채도·명도를 라이트보다 올린다. */
+  --change-added-mark: 127 176 140;    /* #7FB08C */
+  --change-added-text: 155 201 166;    /* #9BC9A6 · panel 위 8.1:1 */
+  --change-added-panel: 27 42 30;      /* #1B2A1E */
+  --change-modified-mark: 225 160 0;   /* #E1A000 */
+  --change-modified-text: 232 190 92;  /* #E8BE5C · 8.7:1 */
+  --change-modified-panel: 44 36 16;   /* #2C2410 */
+  --change-deleted-mark: 186 138 130;  /* #BA8A82 */
+  --change-deleted-text: 214 162 152;  /* #D6A298 · panel 위 7.0:1 */
+  --change-deleted-panel: 48 32 30;    /* #30201E — surface 와 확실히 구분 */
+  --change-moved-mark: 143 165 198;    /* #8FA5C6 */
+  --change-moved-text: 168 187 216;    /* #A8BBD8 · 8.2:1 */
+  --change-moved-panel: 27 34 48;      /* #1B2230 */
+
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238C8E87' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  /* 기본은 도구의 목소리. 법령의 목소리는 .font-serif 로 명시할 때만. */
+  font-family: "Pretendard Variable", Pretendard, "Nanum Gothic", Inter,
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo",
+    "Noto Sans KR", sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+  color: rgb(var(--fg));
+  background: rgb(var(--canvas));
+  /* 한글은 어절 단위로 끊어야 읽힌다. 제2판에서 유일하게 남기는 규칙. */
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+  text-wrap: pretty;
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "kern" 1;
+}
+
+/* 숫자는 자리가 흔들리지 않게. 조문 번호·날짜·D-day·건수 전부. */
+table,
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 법령 토큰(제6조의4제3항 등)은 자간을 조금 벌려 읽기 쉽게. */
+.legal-token {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+  font-feature-settings: "tnum" 1;
+}
+
+/* 링크는 전통적인 파란 밑줄이 아니라 본문색. hover 에서만 primary. */
+a {
+  color: inherit;
+  text-decoration: none;
+}
+a:hover {
+  color: rgb(var(--primary-text));
+}
+
+/* 포커스 — 키보드 사용자에게만. 절대 제거하지 않는다. */
+:focus {
+  outline: none;
+}
+:focus-visible {
+  outline: 2px solid rgb(var(--primary));
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+/* 목록 행처럼 넓은 블록 링크는 바깥 아웃라인만으로는 어디에 포커스가 있는지
+ * 잘 안 보였다(평가: "밑줄 하나로 매우 약함"). offset 2px 짜리 아웃라인이
+ * overflow 를 가진 조상에 잘려 아래쪽 한 줄만 남기 때문이다. 잘릴 수 없는
+ * 안쪽 링을 한 겹 더 둬서 아웃라인이 잘려도 테두리가 남게 한다. */
+a:focus-visible,
+button:focus-visible {
+  box-shadow: inset 0 0 0 2px rgb(var(--primary) / 0.4);
+}
+
+/* primary 면 위에서는 링을 반전 */
+.bg-primary :focus-visible,
+button.bg-primary:focus-visible,
+a.bg-primary:focus-visible {
+  outline-color: rgb(var(--primary-fg));
+  box-shadow: inset 0 0 0 2px rgb(var(--primary-fg) / 0.7);
+}
+
+@layer utilities {
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: rgb(var(--line-strong));
+    border-radius: 4px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  /* 네이티브 select 를 커스텀 드롭다운과 같은 모양으로.
+   * OS 화살표를 끄고 Icon 과 동일한 셰브런을 배경으로 깐다. */
+  .select-field {
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    appearance: none;
+    background-image: var(--select-chevron);
+    background-repeat: no-repeat;
+    background-position: right 0.6875rem center;
+    background-size: 14px 14px;
+    padding-right: 2.25rem;
+  }
+  .select-field[multiple],
+  .select-field[size]:not([size="1"]) {
+    background-image: none;
+    padding-right: revert;
+  }
+
+  /* 조각 경계 — 조문 블록에 hover 했을 때 아주 약하게 드러나는 테두리.
+   * 카드로 감싸지 않으면서 "이것이 하나의 조각"임을 알린다. */
+  .fragment-hover {
+    box-shadow: inset 0 0 0 1px transparent;
+    transition: box-shadow 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .fragment-hover:hover {
+    box-shadow: inset 0 0 0 1px rgb(var(--line));
+  }
+
+  /* skeleton */
+  .skeleton {
+    background: rgb(var(--line));
+    animation: lc-pulse 1.4s ease-in-out infinite;
+  }
+}
+
+@keyframes lc-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────
+ * 인쇄 — "감사팀에 6개월 대응 이력 제출" 시나리오. 기능 요구라 유지.
+ * 다크모드에서 인쇄해도 항상 라이트 팔레트로 복귀한다.
+ * ───────────────────────────────────────────────────────────── */
+@media print {
+  html,
+  html.dark {
+    --canvas: 255 255 255;
+    --surface: 255 255 255;
+    --subtle: 250 250 250;
+    --hover: 250 250 250;
+    --selected: 245 245 245;
+    --fg: 0 0 0;
+    --fg-secondary: 60 60 60;
+    --fg-muted: 100 100 100;
+    --fg-disabled: 140 140 140;
+    --line: 200 200 200;
+    --line-strong: 170 170 170;
+    --primary-text: 40 40 40;
+    /* 4 변경타입도 인쇄용 라이트 값으로. 제4판에서 토큰 이름이 change-* 로
+     * 바뀌었는데 이 블록만 제3판의 diff-* 를 들고 있어서, 다크모드에서
+     * 인쇄하면 조문 패널이 검게 나오고 있었다(잉크 낭비 + 가독성). */
+    --change-added-mark: 60 120 75;
+    --change-added-text: 30 80 45;
+    --change-added-panel: 240 248 242;
+    --change-modified-mark: 150 105 20;
+    --change-modified-text: 110 75 0;
+    --change-modified-panel: 252 246 234;
+    --change-deleted-mark: 150 112 106;
+    --change-deleted-text: 110 66 58;
+    --change-deleted-panel: 246 238 236;
+    --change-moved-mark: 80 100 140;
+    --change-moved-text: 50 70 105;
+    --change-moved-panel: 240 244 252;
+    /* 인쇄에서는 짙은 면이 잉크만 먹는다. 흰 면 + 진한 글자로 바꾸고
+     * 구분은 테두리가 맡는다. */
+    --signature: 255 255 255;
+    --signature-line: 150 150 145;
+    --signature-fg: 20 20 20;
+    --signature-label: 70 70 65;
+    --signature-muted: 90 90 85;
+    --signature-accent: 120 80 0;
+    --select-chevron: none;
+  }
+  body {
+    background: white !important;
+    font-size: 11pt;
+  }
+  .print-hide {
+    display: none !important;
+  }
+  .print-block {
+    display: block !important;
+  }
+  /* 조문이 페이지 경계에서 잘리지 않도록. diff 카드는 <section>, 조문 전문은
+   * <article> 이라 태그를 특정하면 한쪽만 걸린다. */
+  [id^="article-"] {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+  header,
+  aside,
+  nav,
+  button {
+    display: none !important;
+  }
+  a[href^="http"]::after {
+    content: " (" attr(href) ")";
+    color: rgb(100 100 100);
+    font-size: 90%;
+  }
+  @page {
+    margin: 1.5cm 1.5cm 2cm;
+  }
+}

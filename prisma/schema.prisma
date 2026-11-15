@@ -1,0 +1,1304 @@
+// LawChange schema v12 (Round 4.7 Historical Data Retention Hardening)
+// 사용자 기능 도메인의 정식 뼈대. Auth 라운드 전에 스키마 확정.
+// - Workspace 소유권 (개인·팀 통일)
+// - LegalSource (다중 관할·공급자 지원 준비)
+// - ContentUnit 일반화 (조문·부칙·별표·양식·별지)
+// - Watch / ChangeInboxItem / Task / Note 분리
+// - Notification + Delivery + Outbox (recipient = WorkspaceMember)
+// - Composite FK 로 cross-workspace / cross-document 데이터 결합 원천 차단
+//   (Note/Reminder/AuditLog/Notification 포함 전 사용자 데이터)
+// - Historical retention: creator/author/uploader 삭제가 조직 이력을 삭제하지 못하도록 SET NULL
+//
+// 주의사항:
+// 1. Composite FK 중 일부는 raw SQL 로 PG 15+ 컬럼-스코프 SET NULL 을 사용한다
+//    (Prisma schema 는 `SetNull` 로 표기하되 실제 DB 는 `ON DELETE SET NULL (col_name)`).
+//    Prisma advisory warning 이 뜨지만 raw migration 이 진짜 정의. `prisma migrate diff`
+//    를 자동 실행하기 전에 반드시 raw SQL 과의 drift 를 검토한다.
+// 2. Reconciliation partial unique index (v8) 는 v9 duplicate cleanup 보다 먼저
+//    생성된다. v7 상태의 DB 에 duplicate RUNNING 세션이 이미 있다면 v8 이 실패한다.
+//    이 경우 `scripts/db/pre-v8-reconciliation-cleanup.sql` 을 v8 실행 전에 수동 실행.
+//    Fresh install / clean DB 에서는 문제 없음.
+// 3. Legacy user 테이블 (user_watch 등) 은 v7 에서 이미 DROP 되었으므로 v9 guard 는
+//    v7 이 아직 적용되지 않은 DB 를 대비한 보수적 defensive 정책.
+// 5. AppUser lifecycle 정책 (v12):
+//    - AppUser hard-delete 는 WorkspaceMember.userId FK 가 NO ACTION 으로 방어됨.
+//    - 어떤 workspace 에도 소속되지 않은 orphan AppUser 만 물리 삭제 가능.
+//    - 기본 정책: status=DELETED + deletedAt (soft delete). PII 익명화는 별도 job.
+//    - Supabase Auth account 삭제와 AppUser business identity 는 분리 (AuthIdentity CASCADE 유지).
+// 6. WorkspaceMember lifecycle 정책 (v12):
+//    - 기본 leave/remove 는 status 전환 (ACTIVE → SUSPENDED/LEFT). hard-delete 는
+//      실수 방지용 관리자 액션에만.
+//    - creator/author/uploader/actor FK 는 모두 SET NULL 이므로 hard-delete 되어도
+//      historical row (Watch/Task/Evidence/Note/Mapping/AuditLog) 는 살아남고
+//      actor 컬럼만 NULL 이 된다.
+// 7. Notification.recipientMember 는 CASCADE 유지: 개인 알림은 audit 성격이 아니므로
+//    member 삭제 시 personal notification 도 삭제해도 무방.
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// A. Identity / Workspace
+// ═══════════════════════════════════════════════════════════════
+
+model AppUser {
+  id          String    @id @default(cuid())
+  email       String?
+  displayName String?   @map("display_name")
+  status      String    @default("ACTIVE") // ACTIVE | SUSPENDED | DELETED
+  locale      String    @default("ko-KR")
+  timezone    String    @default("Asia/Seoul")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  identities  AuthIdentity[]
+  memberships WorkspaceMember[]
+  auditLogs   AdminAuditLog[]
+
+  @@index([email])
+  @@map("app_user")
+}
+
+model AuthIdentity {
+  id              String    @id @default(cuid())
+  userId          String    @map("user_id")
+  provider        String // SUPABASE | GOOGLE | APPLE
+  providerSubject String    @map("provider_subject") // Supabase auth.users.id 등
+  email           String?
+  createdAt       DateTime  @default(now()) @map("created_at")
+  lastLoginAt     DateTime? @map("last_login_at")
+
+  user AppUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerSubject])
+  @@index([userId])
+  @@map("auth_identity")
+}
+
+model Workspace {
+  id         String    @id @default(cuid())
+  type       String // PERSONAL | TEAM
+  name       String
+  slug       String?
+  status     String    @default("ACTIVE") // ACTIVE | SUSPENDED | ARCHIVED
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+  archivedAt DateTime? @map("archived_at")
+
+  members        WorkspaceMember[]
+  invitations    WorkspaceInvitation[]
+  departments    Department[]
+  folders        Folder[]
+  watches        Watch[]
+  inboxItems     ChangeInboxItem[]
+  tasks          Task[]
+  documentNotes  DocumentNote[]
+  inboxNotes     InboxNote[]
+  notifications  Notification[]
+  reminders      Reminder[]
+  evidence       Evidence[]
+  policies       InternalPolicy[]
+  policyMappings LegalPolicyMapping[]
+  auditLogs      WorkspaceAuditLog[]
+
+  @@unique([slug])
+  @@index([status])
+  @@map("workspace")
+}
+
+model WorkspaceMember {
+  id          String   @id @default(cuid())
+  workspaceId String   @map("workspace_id")
+  userId      String   @map("user_id")
+  role        String // OWNER | ADMIN | MEMBER | VIEWER
+  status      String   @default("ACTIVE") // ACTIVE | INVITED | SUSPENDED | LEFT
+  joinedAt    DateTime @default(now()) @map("joined_at")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  workspace             Workspace               @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user                  AppUser                 @relation(fields: [userId], references: [id], onDelete: NoAction) // v12: AppUser hard-delete 방어 — soft-delete only
+  createdWatches        Watch[]                 @relation("WatchCreator")
+  ownedWatches          Watch[]                 @relation("WatchOwner")
+  assignedInboxItems    ChangeInboxItem[]       @relation("InboxAssignee")
+  createdTasks          Task[]                  @relation("TaskCreator")
+  assignedTasks         Task[]                  @relation("TaskAssignee")
+  documentNotes         DocumentNote[]
+  inboxNotes            InboxNote[]
+  notificationPref      NotificationPreference?
+  auditLogs             WorkspaceAuditLog[]     @relation("AuditActor")
+  reminders             Reminder[]
+  departments           DepartmentMember[]
+  uploadedEvidence      Evidence[]
+  createdMappings       LegalPolicyMapping[]
+  reviewedApprovals     TaskApproval[]          @relation("TaskApprovalReviewer")
+  approvedApprovals     TaskApproval[]          @relation("TaskApprovalApprover")
+  policyVersionsCreated InternalPolicyVersion[] @relation("PolicyVersionCreator")
+  receivedNotifications Notification[]          @relation("NotificationRecipient")
+  sentInvitations       WorkspaceInvitation[]   @relation("InvitationInviter")
+
+  @@unique([workspaceId, userId])
+  @@unique([id, workspaceId], map: "workspace_member_id_workspace_unique")
+  @@index([userId, status])
+  @@map("workspace_member")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Department — 부서 단위 업무 배정 (한국 조직 구조 대응)
+// ────────────────────────────────────────────────────────────────
+model Department {
+  id          String    @id @default(cuid())
+  workspaceId String    @map("workspace_id")
+  name        String
+  code        String?
+  parentId    String?   @map("parent_id")
+  status      String    @default("ACTIVE") // ACTIVE | ARCHIVED
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  archivedAt  DateTime? @map("archived_at")
+
+  workspace       Workspace                 @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  parent          Department?               @relation("DepartmentTree", fields: [parentId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+  children        Department[]              @relation("DepartmentTree")
+  members         DepartmentMember[]
+  ownedWatches    Watch[]                   @relation("WatchOwnerDept")
+  ownedInboxes    ChangeInboxItem[]         @relation("InboxOwnerDept")
+  affectedInboxes InboxAffectedDepartment[]
+  ownedTasks      Task[]                    @relation("TaskOwnerDept")
+  ownedPolicies   InternalPolicy[]          @relation("PolicyOwnerDept")
+
+  @@unique([workspaceId, name])
+  @@unique([id, workspaceId], map: "department_id_workspace_unique")
+  @@index([workspaceId, status])
+  @@map("department")
+}
+
+model DepartmentMember {
+  id                String   @id @default(cuid())
+  workspaceId       String   @map("workspace_id") // denormalized for composite FK (tenant guard)
+  departmentId      String   @map("department_id")
+  workspaceMemberId String   @map("workspace_member_id")
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  department Department      @relation(fields: [departmentId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+  member     WorkspaceMember @relation(fields: [workspaceMemberId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+
+  @@unique([departmentId, workspaceMemberId])
+  @@index([workspaceId], map: "department_member_workspace_id_idx")
+  @@map("department_member")
+}
+
+model WorkspaceInvitation {
+  id                String    @id @default(cuid())
+  workspaceId       String    @map("workspace_id")
+  email             String
+  role              String
+  tokenHash         String    @map("token_hash")
+  invitedByMemberId String?   @map("invited_by_member_id") // v12: WorkspaceMember composite FK, nullable (SET NULL on inviter delete)
+  expiresAt         DateTime  @map("expires_at")
+  acceptedAt        DateTime? @map("accepted_at")
+  revokedAt         DateTime? @map("revoked_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+
+  workspace       Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  invitedByMember WorkspaceMember? @relation("InvitationInviter", fields: [invitedByMemberId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+
+  @@unique([tokenHash])
+  @@index([workspaceId, acceptedAt])
+  @@index([email])
+  @@index([invitedByMemberId], map: "workspace_invitation_invited_by_member_id_idx")
+  @@map("workspace_invitation")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// B. Legal Corpus
+// ═══════════════════════════════════════════════════════════════
+
+model LegalSource {
+  id               String   @id @default(cuid())
+  jurisdictionCode String   @map("jurisdiction_code") // KR | JP | ...
+  providerCode     String   @map("provider_code") // KR_MOLEG | KR_LOCAL | JP_EGOV
+  sourceType       String   @map("source_type") // LAW | ADMIN_RULE | LOCAL_RULE
+  name             String
+  enabled          Boolean  @default(true)
+  baseUrl          String?  @map("base_url")
+  metadata         Json?
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  documents LegalDocument[]
+
+  @@unique([jurisdictionCode, providerCode, sourceType])
+  @@map("legal_source")
+}
+
+model LegalDocument {
+  id                 String    @id @default(cuid())
+  legalSourceId      String    @map("legal_source_id")
+  externalDocumentId String    @map("external_document_id") // 법제처 법령ID or 행정규칙ID
+  documentType       String    @map("document_type")
+  documentTypeCode   String?   @map("document_type_code")
+  currentTitle       String    @map("current_title")
+  currentShortTitle  String?   @map("current_short_title")
+  currentAgencyName  String?   @map("current_agency_name")
+  currentAgencyCode  String?   @map("current_agency_code")
+  officialUrl        String?   @map("official_url")
+  status             String    @default("ACTIVE") // ACTIVE | REPEALED | INVALIDATED | UNKNOWN
+  currentVersionId   String?   @map("current_version_id")
+  firstSeenAt        DateTime  @default(now()) @map("first_seen_at")
+  lastSeenAt         DateTime  @default(now()) @map("last_seen_at")
+  lastCheckedAt      DateTime  @default(now()) @map("last_checked_at")
+  /**
+   * 이 문서의 최신 개정일 = MAX(버전의 공포일, 발령일).
+   * 목록의 기본 정렬(최근 개정순)이 쓰는 값이다. 원래는 조회할 때마다
+   * legal_document_version 에 LATERAL 로 물어봤는데, 문서마다 한 번씩
+   * 도느라 문서 수에 선형으로 느려졌다 — 실측 15,850건 161ms → 24,527건
+   * 330ms (EXPLAIN: LATERAL loops=24527, buffer 151,154 중 150,226).
+   * 컬럼으로 내리고 인덱스를 걸어 인덱스 스캔으로 바꾼다.
+   * 갱신 책임은 수집기에 있다 — 버전을 만들 때 같이 올린다.
+   */
+  lastChangeAt       DateTime? @map("last_change_at")
+  repealedAt         DateTime? @map("repealed_at")
+  metadata           Json?
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
+
+  legalSource        LegalSource              @relation(fields: [legalSourceId], references: [id])
+  versions           LegalDocumentVersion[]
+  contentUnits       LegalContentUnit[]
+  changeEvents       LegalChangeEvent[]
+  watches            Watch[]
+  documentNotes      DocumentNote[]
+  outgoingRelations  LegalDocumentRelation[]  @relation("RelationFrom")
+  incomingRelations  LegalDocumentRelation[]  @relation("RelationTo")
+  topics             DocumentTopic[]
+  policyMappings     LegalPolicyMapping[]
+  interpretations    LegalInterpretationLaw[]
+  agencyDecisionLaws AgencyDecisionLaw[]
+
+  @@unique([legalSourceId, externalDocumentId])
+  @@index([legalSourceId])
+  @@index([documentType])
+  @@index([currentAgencyCode])
+  @@index([currentTitle])
+  @@index([status])
+  @@index([lastCheckedAt])
+  @@index([lastChangeAt(sort: Desc)])
+  @@map("legal_document")
+}
+
+model LegalDocumentVersion {
+  id                   String    @id @default(cuid())
+  documentId           String    @map("document_id")
+  externalVersionId    String    @map("external_version_id") // 법령일련번호 or 행정규칙일련번호
+  revisionSequence     Int       @default(0) @map("revision_sequence")
+  revisionType         String    @map("revision_type")
+  titleSnapshot        String?   @map("title_snapshot")
+  agencyNameSnapshot   String?   @map("agency_name_snapshot")
+  agencyCodeSnapshot   String?   @map("agency_code_snapshot")
+  promulgationNumber   String?   @map("promulgation_number")
+  promulgationDate     DateTime? @map("promulgation_date")
+  issuanceNumber       String?   @map("issuance_number")
+  issuanceDate         DateTime? @map("issuance_date")
+  effectiveDate        DateTime? @map("effective_date")
+  effectiveDateText    String?   @map("effective_date_text")
+  statusSnapshot       String?   @map("status_snapshot")
+  contentHash          String    @map("content_hash")
+  parserVersion        String    @default("v1") @map("parser_version")
+  normalizationVersion String    @default("v1") @map("normalization_version")
+  rawObjectPath        String?   @map("raw_object_path")
+  normalizedContent    Json?     @map("normalized_content")
+  sourceUpdatedAt      DateTime? @map("source_updated_at")
+  collectedAt          DateTime  @default(now()) @map("collected_at")
+  createdAt            DateTime  @default(now()) @map("created_at")
+
+  document            LegalDocument             @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  contentUnitVersions LegalContentUnitVersion[]
+  attachments         LegalAttachment[]
+  fromChangeEvents    LegalChangeEvent[]        @relation("PreviousVersion")
+  toChangeEvents      LegalChangeEvent[]        @relation("NewVersion")
+
+  // 법제처는 같은 공포건(법령일련번호)을 시행일별로 여러 줄 준다 — 분할시행.
+  // 예) 식품위생법 제20898호: 2025.4.1 시행 / 2028.7.1 시행.
+  // (documentId, externalVersionId) 만 유일키로 쓰면 한 줄만 저장되고
+  // 나머지가 조용히 버려진다. 실측(법률·대통령령 60개 표본):
+  //   분할시행이 있는 법령 36.7% · 버전 행의 6.1% 누락
+  //   그중 결정적인 것 — 6.7% 의 법령이 "시행 예정 없음" 으로 보이는데
+  //   실제로는 앞으로 닥칠 시행일이 있었다(전부 화면 0건 / 실제 1건).
+  // 컴플라이언스 화면이 안심시키는 방향으로 틀리는 것이라 시행일을 키에 넣는다.
+  // effectiveDate 가 NULL 인 행은 현재 0건이지만 컬럼이 nullable 이므로
+  // 마이그레이션에서 NULLS NOT DISTINCT 를 붙여 NULL 중복도 막는다.
+  @@unique([documentId, externalVersionId, effectiveDate], map: "legal_document_version_doc_version_effective_unique")
+  @@unique([id, documentId], map: "legal_document_version_id_document_unique")
+  @@index([externalVersionId])
+  @@index([documentId, promulgationDate(sort: Desc)])
+  @@index([documentId, issuanceDate(sort: Desc)])
+  @@index([effectiveDate])
+  @@index([contentHash])
+  @@map("legal_document_version")
+}
+
+model LegalContentUnit {
+  id                 String   @id @default(cuid())
+  documentId         String   @map("document_id")
+  unitType           String   @map("unit_type") // ARTICLE | ADDENDUM | ANNEX | FORM | TABLE | CHAPTER | SECTION | OTHER
+  canonicalKey       String   @map("canonical_key") // 문서 내 안정 ID (예: 조문키)
+  currentLabel       String?  @map("current_label")
+  /**
+   * 조문 제목. "벌칙" · "과태료" · "영업 신고".
+   * 원래는 legal_content_unit_version 에만 있었다. 그런데 개정 신호를 판정하려면
+   * "바뀐 조문이 벌칙 조문인가" 를 diff 마다 물어야 하는데, legal_diff 에서
+   * 버전 테이블로 가는 길이 없다 — new/old_content_unit_version_id 는 전부
+   * NULL 이고(1,154,799행 중 0), content_unit_id 만 채워져 있다.
+   * content_unit_id 로 버전을 뒤지면 유일키가 (document_version_id, content_unit_id)
+   * 라 앞 컬럼이 없어 인덱스를 못 타고 타임아웃난다.
+   * 조문 제목은 개정으로 잘 바뀌지 않으므로 "현재 제목" 을 여기 둔다.
+   * 갱신 책임은 수집기에 있다 — 조문 버전을 만들 때 같이 올린다.
+   */
+  currentTitle       String?  @map("current_title")
+  firstSeenVersionId String?  @map("first_seen_version_id")
+  lastSeenVersionId  String?  @map("last_seen_version_id")
+  status             String   @default("ACTIVE") // ACTIVE | REMOVED
+  createdAt          DateTime @default(now()) @map("created_at")
+
+  document       LegalDocument             @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  versions       LegalContentUnitVersion[]
+  diffs          LegalDiff[]
+  attachments    LegalAttachment[]
+  policyMappings LegalPolicyMapping[]
+  watchScopes    WatchContentScope[]
+
+  @@unique([documentId, unitType, canonicalKey])
+  @@unique([id, documentId], map: "legal_content_unit_id_document_unique")
+  @@index([documentId, unitType])
+  @@map("legal_content_unit")
+}
+
+model LegalContentUnitVersion {
+  id                String    @id @default(cuid())
+  documentId        String    @map("document_id") // denormalized (== contentUnit.documentId == documentVersion.documentId)
+  contentUnitId     String    @map("content_unit_id")
+  documentVersionId String    @map("document_version_id")
+  sourceKey         String    @map("source_key")
+  unitNumber        String?   @map("unit_number")
+  unitTitle         String?   @map("unit_title")
+  unitOrder         Int       @map("unit_order")
+  contentText       String    @map("content_text")
+  contentHash       String    @map("content_hash")
+  effectiveDate     DateTime? @map("effective_date")
+  metadata          Json?
+  createdAt         DateTime  @default(now()) @map("created_at")
+
+  contentUnit     LegalContentUnit     @relation(fields: [contentUnitId, documentId], references: [id, documentId], onDelete: Cascade)
+  documentVersion LegalDocumentVersion @relation(fields: [documentVersionId, documentId], references: [id, documentId], onDelete: Cascade)
+  oldDiffs        LegalDiff[]          @relation("DiffOldUnitVersion")
+  newDiffs        LegalDiff[]          @relation("DiffNewUnitVersion")
+
+  @@unique([documentVersionId, contentUnitId])
+  @@unique([id, documentId], map: "legal_content_unit_version_id_document_unique")
+  @@index([contentUnitId])
+  @@index([contentHash])
+  @@index([documentVersionId, unitOrder])
+  @@index([documentId], map: "legal_content_unit_version_document_id_idx")
+  @@map("legal_content_unit_version")
+}
+
+model LegalAttachment {
+  id                String   @id @default(cuid())
+  documentId        String   @map("document_id") // denormalized (== documentVersion.documentId)
+  documentVersionId String   @map("document_version_id")
+  contentUnitId     String?  @map("content_unit_id")
+  attachmentType    String   @map("attachment_type") // ANNEX | FORM | FILE | OTHER
+  sourceUrl         String?  @map("source_url")
+  objectPath        String?  @map("object_path")
+  fileName          String?  @map("file_name")
+  mimeType          String?  @map("mime_type")
+  fileSize          Int?     @map("file_size")
+  contentHash       String?  @map("content_hash")
+  collectedAt       DateTime @default(now()) @map("collected_at")
+  metadata          Json?
+
+  documentVersion LegalDocumentVersion @relation(fields: [documentVersionId, documentId], references: [id, documentId], onDelete: Cascade)
+  contentUnit     LegalContentUnit?    @relation(fields: [contentUnitId, documentId], references: [id, documentId], onDelete: SetNull)
+
+  @@index([documentVersionId])
+  @@index([documentId], map: "legal_attachment_document_id_idx")
+  @@map("legal_attachment")
+}
+
+model LegalChangeEvent {
+  id                   String    @id @default(cuid())
+  documentId           String    @map("document_id")
+  previousVersionId    String?   @map("previous_version_id")
+  newVersionId         String    @map("new_version_id")
+  eventType            String    @map("event_type") // FIRST_ISSUE | REVISION | REPEAL | CORRECTION | TITLE_CHANGE
+  discoveryType        String    @default("LIVE_DETECTION") @map("discovery_type")
+  notificationEligible Boolean   @default(true) @map("notification_eligible")
+  promulgationDate     DateTime? @map("promulgation_date")
+  issuanceDate         DateTime? @map("issuance_date")
+  effectiveDate        DateTime? @map("effective_date")
+  effectiveDateText    String?   @map("effective_date_text")
+  detectedAt           DateTime  @default(now()) @map("detected_at")
+  totalDiffCount       Int       @default(0) @map("total_diff_count") // = changedArticleCount 개념 확장
+  addedCount           Int       @default(0) @map("added_count")
+  modifiedCount        Int       @default(0) @map("modified_count")
+  deletedCount         Int       @default(0) @map("deleted_count")
+  movedCount           Int       @default(0) @map("moved_count")
+  contentTypeSummary   Json?     @map("content_type_summary") // {ARTICLE: 3, ADDENDUM: 1}
+  status               String    @default("PUBLISHED") // DRAFT | PUBLISHED | WITHDRAWN
+  createdAt            DateTime  @default(now()) @map("created_at")
+
+  document        LegalDocument         @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  previousVersion LegalDocumentVersion? @relation("PreviousVersion", fields: [previousVersionId, documentId], references: [id, documentId])
+  newVersion      LegalDocumentVersion  @relation("NewVersion", fields: [newVersionId, documentId], references: [id, documentId])
+  diffs           LegalDiff[]
+  inboxItems      ChangeInboxItem[]
+  notifications   Notification[]
+
+  @@unique([newVersionId])
+  @@unique([id, documentId], map: "legal_change_event_id_document_unique")
+  @@index([documentId, promulgationDate(sort: Desc)])
+  @@index([documentId, issuanceDate(sort: Desc)])
+  @@index([documentId, detectedAt(sort: Desc)])
+  @@index([effectiveDate])
+  @@index([notificationEligible, detectedAt])
+  @@map("legal_change_event")
+}
+
+model LegalDiff {
+  id                      String   @id @default(cuid())
+  documentId              String   @map("document_id") // denormalized (== changeEvent.documentId)
+  changeEventId           String   @map("change_event_id")
+  contentUnitId           String?  @map("content_unit_id")
+  oldContentUnitVersionId String?  @map("old_content_unit_version_id")
+  newContentUnitVersionId String?  @map("new_content_unit_version_id")
+  unitType                String   @default("ARTICLE") @map("unit_type")
+  changeType              String   @map("change_type") // ADDED | DELETED | MODIFIED | MOVED | TITLE_CHANGED | EFFECTIVE_DATE_CHANGED
+  oldLabel                String?  @map("old_label") // 표시용 "제15조" 등
+  newLabel                String?  @map("new_label")
+  oldText                 String?  @map("old_text")
+  newText                 String?  @map("new_text")
+  diffOperations          Json?    @map("diff_operations")
+  createdAt               DateTime @default(now()) @map("created_at")
+
+  changeEvent           LegalChangeEvent         @relation(fields: [changeEventId, documentId], references: [id, documentId], onDelete: Cascade)
+  contentUnit           LegalContentUnit?        @relation(fields: [contentUnitId, documentId], references: [id, documentId], onDelete: SetNull)
+  oldContentUnitVersion LegalContentUnitVersion? @relation("DiffOldUnitVersion", fields: [oldContentUnitVersionId, documentId], references: [id, documentId], onDelete: SetNull)
+  newContentUnitVersion LegalContentUnitVersion? @relation("DiffNewUnitVersion", fields: [newContentUnitVersionId, documentId], references: [id, documentId], onDelete: SetNull)
+
+  @@index([changeEventId, unitType])
+  @@index([contentUnitId])
+  @@index([changeType])
+  @@index([documentId], map: "legal_diff_document_id_idx")
+  @@map("legal_diff")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// C. User Workflow
+// ═══════════════════════════════════════════════════════════════
+
+model Folder {
+  id          String    @id @default(cuid())
+  workspaceId String    @map("workspace_id")
+  parentId    String?   @map("parent_id")
+  name        String
+  color       String?
+  sortOrder   Int       @default(0) @map("sort_order")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  archivedAt  DateTime? @map("archived_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  parent    Folder?   @relation("FolderTree", fields: [parentId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+  children  Folder[]  @relation("FolderTree")
+  watches   Watch[]
+
+  @@unique([id, workspaceId], map: "folder_id_workspace_unique")
+  @@index([workspaceId, archivedAt])
+  @@map("folder")
+}
+
+// Watch = 적용법규대장
+// 단순 즐겨찾기가 아니라 "우리 조직에 적용되는 법규 대장" 역할.
+// applicabilityStatus, importance, owner, reviewFrequency 를 함께 관리.
+model Watch {
+  id                        String    @id @default(cuid())
+  workspaceId               String    @map("workspace_id")
+  documentId                String    @map("document_id")
+  folderId                  String?   @map("folder_id")
+  status                    String    @default("ACTIVE") // ACTIVE | PAUSED
+  applicabilityStatus       String    @default("UNKNOWN") @map("applicability_status") // UNKNOWN | APPLICABLE | NOT_APPLICABLE | NEEDS_REVIEW
+  applicabilityReason       String?   @map("applicability_reason")
+  importance                String    @default("NORMAL") // LOW | NORMAL | HIGH | CRITICAL
+  ownerDepartmentId         String?   @map("owner_department_id")
+  ownerMemberId             String?   @map("owner_member_id")
+  reviewFrequencyMonths     Int?      @map("review_frequency_months") // 3 = 분기, 6 = 반기, 12 = 연간
+  lastReviewedAt            DateTime? @map("last_reviewed_at")
+  nextReviewAt              DateTime? @map("next_review_at")
+  createdByMemberId         String?   @map("created_by_member_id") // v12: nullable — historical retention
+  notifyInApp               Boolean   @default(true) @map("notify_in_app")
+  notifyEmail               Boolean   @default(false) @map("notify_email")
+  notifyOnChange            Boolean   @default(true) @map("notify_on_change")
+  notifyBeforeEffectiveDays Json?     @map("notify_before_effective_days") // [30, 7, 0]
+  createdAt                 DateTime  @default(now()) @map("created_at")
+  updatedAt                 DateTime  @updatedAt @map("updated_at")
+  archivedAt                DateTime? @map("archived_at")
+
+  workspace       Workspace           @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  document        LegalDocument       @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  folder          Folder?             @relation(fields: [folderId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+  createdByMember WorkspaceMember?    @relation("WatchCreator", fields: [createdByMemberId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+  ownerDepartment Department?         @relation("WatchOwnerDept", fields: [ownerDepartmentId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+  ownerMember     WorkspaceMember?    @relation("WatchOwner", fields: [ownerMemberId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+  contentScopes   WatchContentScope[]
+  inboxItems      ChangeInboxItem[]
+
+  @@unique([workspaceId, documentId])
+  @@unique([id, workspaceId], map: "watch_id_workspace_unique")
+  @@unique([id, workspaceId, documentId], map: "watch_id_workspace_document_unique")
+  @@index([workspaceId, status])
+  @@index([workspaceId, applicabilityStatus])
+  @@index([documentId, status])
+  @@index([ownerDepartmentId, status])
+  @@index([nextReviewAt])
+  @@map("watch")
+}
+
+model WatchContentScope {
+  id            String   @id @default(cuid())
+  workspaceId   String   @map("workspace_id") // denormalized for composite FK
+  documentId    String   @map("document_id") // denormalized for cross-document guard
+  watchId       String   @map("watch_id")
+  contentUnitId String   @map("content_unit_id")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  watch       Watch            @relation(fields: [watchId, workspaceId, documentId], references: [id, workspaceId, documentId], onDelete: Cascade)
+  contentUnit LegalContentUnit @relation(fields: [contentUnitId, documentId], references: [id, documentId], onDelete: Cascade)
+
+  @@unique([watchId, contentUnitId])
+  @@index([contentUnitId])
+  @@index([workspaceId], map: "watch_content_scope_workspace_id_idx")
+  @@map("watch_content_scope")
+}
+
+model ChangeInboxItem {
+  id                  String    @id @default(cuid())
+  workspaceId         String    @map("workspace_id")
+  changeEventId       String    @map("change_event_id")
+  watchId             String?   @map("watch_id")
+  status              String    @default("NEW") // NEW | REVIEWING | ACTION_REQUIRED | MONITORING | DONE | DISMISSED
+  applicability       String    @default("UNKNOWN") // UNKNOWN | APPLICABLE | NOT_APPLICABLE | NEEDS_REVIEW
+  applicabilityReason String?   @map("applicability_reason")
+  impactLevel         String?   @map("impact_level") // LOW | MEDIUM | HIGH | CRITICAL
+  assessmentText      String?   @map("assessment_text")
+  priority            String    @default("NORMAL") // LOW | NORMAL | HIGH | URGENT
+  assignedToMemberId  String?   @map("assigned_to_member_id")
+  ownerDepartmentId   String?   @map("owner_department_id")
+  dueAt               DateTime? @map("due_at")
+  firstNotifiedAt     DateTime? @map("first_notified_at")
+  openedAt            DateTime? @map("opened_at")
+  reviewedAt          DateTime? @map("reviewed_at")
+  completedAt         DateTime? @map("completed_at")
+  dismissedAt         DateTime? @map("dismissed_at")
+  archivedAt          DateTime? @map("archived_at")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
+
+  workspace           Workspace                 @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  changeEvent         LegalChangeEvent          @relation(fields: [changeEventId], references: [id], onDelete: Cascade)
+  watch               Watch?                    @relation(fields: [watchId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+  assignedToMember    WorkspaceMember?          @relation("InboxAssignee", fields: [assignedToMemberId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+  ownerDepartment     Department?               @relation("InboxOwnerDept", fields: [ownerDepartmentId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+  affectedDepartments InboxAffectedDepartment[]
+  tasks               Task[]
+  notes               InboxNote[]
+  reminders           Reminder[]
+  notifications       Notification[]
+
+  @@unique([workspaceId, changeEventId])
+  @@unique([id, workspaceId], map: "change_inbox_item_id_workspace_unique")
+  @@index([workspaceId, status, createdAt(sort: Desc)])
+  @@index([workspaceId, dueAt])
+  @@index([assignedToMemberId, status])
+  @@index([ownerDepartmentId, status])
+  @@index([changeEventId])
+  @@map("change_inbox_item")
+}
+
+model InboxAffectedDepartment {
+  id           String   @id @default(cuid())
+  workspaceId  String   @map("workspace_id") // denormalized for composite FK
+  inboxItemId  String   @map("inbox_item_id")
+  departmentId String   @map("department_id")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  inboxItem  ChangeInboxItem @relation(fields: [inboxItemId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+  department Department      @relation(fields: [departmentId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+
+  @@unique([inboxItemId, departmentId])
+  @@index([workspaceId], map: "inbox_affected_department_workspace_id_idx")
+  @@map("inbox_affected_department")
+}
+
+model Task {
+  id                String    @id @default(cuid())
+  workspaceId       String    @map("workspace_id")
+  inboxItemId       String?   @map("inbox_item_id")
+  title             String
+  description       String?
+  status            String    @default("TODO") // TODO | IN_PROGRESS | DONE | CANCELLED
+  priority          String    @default("NORMAL")
+  ownerDepartmentId String?   @map("owner_department_id")
+  assigneeMemberId  String?   @map("assignee_member_id")
+  createdByMemberId String?   @map("created_by_member_id") // v12: nullable — historical retention
+  dueAt             DateTime? @map("due_at")
+  startedAt         DateTime? @map("started_at")
+  completedAt       DateTime? @map("completed_at")
+  sortOrder         Int       @default(0) @map("sort_order")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+  archivedAt        DateTime? @map("archived_at")
+
+  workspace       Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  inboxItem       ChangeInboxItem? @relation(fields: [inboxItemId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+  ownerDepartment Department?      @relation("TaskOwnerDept", fields: [ownerDepartmentId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+  assigneeMember  WorkspaceMember? @relation("TaskAssignee", fields: [assigneeMemberId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+  createdByMember WorkspaceMember? @relation("TaskCreator", fields: [createdByMemberId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+  reminders       Reminder[]
+  notifications   Notification[]
+  evidence        Evidence[]
+  approvals       TaskApproval[]
+
+  @@unique([id, workspaceId], map: "task_id_workspace_unique")
+  @@index([workspaceId, status, dueAt])
+  @@index([assigneeMemberId, status])
+  @@index([ownerDepartmentId, status])
+  @@index([inboxItemId])
+  @@map("task")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Evidence — Task 완료 증빙
+// ────────────────────────────────────────────────────────────────
+model Evidence {
+  id                 String    @id @default(cuid())
+  workspaceId        String    @map("workspace_id")
+  taskId             String    @map("task_id")
+  type               String // FILE | LINK | SCREENSHOT | APPROVAL_DOCUMENT | TRAINING_RESULT | SYSTEM_CHANGE | OTHER
+  fileReference      String?   @map("file_reference") // 파일 스토리지 경로
+  externalUrl        String?   @map("external_url")
+  description        String?
+  uploadedByMemberId String?   @map("uploaded_by_member_id") // v12: nullable — historical retention
+  createdAt          DateTime  @default(now()) @map("created_at")
+  deletedAt          DateTime? @map("deleted_at")
+
+  workspace        Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  task             Task             @relation(fields: [taskId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+  uploadedByMember WorkspaceMember? @relation(fields: [uploadedByMemberId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+
+  @@index([taskId, deletedAt])
+  @@index([workspaceId, createdAt(sort: Desc)])
+  @@map("evidence")
+}
+
+// ────────────────────────────────────────────────────────────────
+// TaskApproval — 간이 승인 (전자결재 대체 아님)
+// MVP: Task 당 1개 (검토자 + 승인자 지정 + 승인/반려). 다단계 결재는 별도 모델로.
+// ────────────────────────────────────────────────────────────────
+model TaskApproval {
+  id               String    @id @default(cuid())
+  workspaceId      String    @map("workspace_id") // denormalized for composite FK
+  taskId           String    @unique @map("task_id")
+  reviewerMemberId String?   @map("reviewer_member_id")
+  approverMemberId String?   @map("approver_member_id")
+  status           String    @default("PENDING") // PENDING | APPROVED | REJECTED | CANCELLED
+  reviewComment    String?   @map("review_comment")
+  approvalComment  String?   @map("approval_comment")
+  reviewedAt       DateTime? @map("reviewed_at")
+  approvedAt       DateTime? @map("approved_at")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  task           Task             @relation(fields: [taskId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+  reviewerMember WorkspaceMember? @relation("TaskApprovalReviewer", fields: [reviewerMemberId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+  approverMember WorkspaceMember? @relation("TaskApprovalApprover", fields: [approverMemberId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+
+  @@index([taskId, status])
+  @@index([status, createdAt(sort: Desc)])
+  @@index([workspaceId], map: "task_approval_workspace_id_idx")
+  @@map("task_approval")
+}
+
+model DocumentNote {
+  id             String    @id @default(cuid())
+  workspaceId    String    @map("workspace_id")
+  documentId     String    @map("document_id")
+  authorMemberId String?   @map("author_member_id") // v12: nullable — historical retention
+  content        String
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+  deletedAt      DateTime? @map("deleted_at")
+
+  workspace    Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  document     LegalDocument    @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  authorMember WorkspaceMember? @relation(fields: [authorMemberId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+
+  @@index([workspaceId, documentId, deletedAt])
+  @@map("document_note")
+}
+
+model InboxNote {
+  id             String    @id @default(cuid())
+  workspaceId    String    @map("workspace_id")
+  inboxItemId    String    @map("inbox_item_id")
+  authorMemberId String?   @map("author_member_id") // v12: nullable — historical retention
+  content        String
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+  deletedAt      DateTime? @map("deleted_at")
+
+  workspace    Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  inboxItem    ChangeInboxItem  @relation(fields: [inboxItemId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+  authorMember WorkspaceMember? @relation(fields: [authorMemberId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+
+  @@index([workspaceId, inboxItemId, deletedAt])
+  @@map("inbox_note")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// D. Notification / Reminder / Outbox
+// ═══════════════════════════════════════════════════════════════
+
+model NotificationPreference {
+  id                String   @id @default(cuid())
+  workspaceMemberId String   @unique @map("workspace_member_id")
+  changeInApp       Boolean  @default(true) @map("change_in_app")
+  changeEmail       Boolean  @default(false) @map("change_email")
+  reminderInApp     Boolean  @default(true) @map("reminder_in_app")
+  reminderEmail     Boolean  @default(false) @map("reminder_email")
+  digestMode        String   @default("IMMEDIATE") @map("digest_mode") // IMMEDIATE | DAILY | WEEKLY | OFF
+  quietHoursStart   String?  @map("quiet_hours_start")
+  quietHoursEnd     String?  @map("quiet_hours_end")
+  timezone          String   @default("Asia/Seoul")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  member WorkspaceMember @relation(fields: [workspaceMemberId], references: [id], onDelete: Cascade)
+
+  @@map("notification_preference")
+}
+
+model Notification {
+  id                String    @id @default(cuid())
+  workspaceId       String    @map("workspace_id")
+  recipientMemberId String    @map("recipient_member_id")
+  kind              String // CHANGE_DETECTED | TASK_ASSIGNED | TASK_DUE | REMINDER | SYSTEM
+  changeEventId     String?   @map("change_event_id")
+  inboxItemId       String?   @map("inbox_item_id")
+  taskId            String?   @map("task_id")
+  title             String
+  body              String
+  dedupeKey         String?   @map("dedupe_key")
+  readAt            DateTime? @map("read_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+
+  workspace   Workspace              @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  recipient   WorkspaceMember        @relation("NotificationRecipient", fields: [recipientMemberId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+  changeEvent LegalChangeEvent?      @relation(fields: [changeEventId], references: [id], onDelete: SetNull)
+  inboxItem   ChangeInboxItem?       @relation(fields: [inboxItemId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+  task        Task?                  @relation(fields: [taskId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+  deliveries  NotificationDelivery[]
+
+  @@index([recipientMemberId, readAt, createdAt(sort: Desc)], map: "notification_recipient_member_id_read_at_created_at_idx")
+  @@index([workspaceId, createdAt(sort: Desc)])
+  @@map("notification")
+}
+
+model NotificationDelivery {
+  id                String    @id @default(cuid())
+  notificationId    String    @map("notification_id")
+  channel           String // EMAIL | PUSH
+  status            String    @default("PENDING") // PENDING | PROCESSING | SENT | FAILED | CANCELLED
+  attemptCount      Int       @default(0) @map("attempt_count")
+  nextAttemptAt     DateTime? @map("next_attempt_at")
+  provider          String?
+  providerMessageId String?   @map("provider_message_id")
+  sentAt            DateTime? @map("sent_at")
+  lastError         String?   @map("last_error")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  notification Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+
+  @@unique([notificationId, channel])
+  @@index([status, nextAttemptAt])
+  @@map("notification_delivery")
+}
+
+model Reminder {
+  id                String    @id @default(cuid())
+  workspaceId       String    @map("workspace_id")
+  recipientMemberId String?   @map("recipient_member_id")
+  inboxItemId       String?   @map("inbox_item_id")
+  taskId            String?   @map("task_id")
+  remindAt          DateTime  @map("remind_at")
+  channel           String    @default("IN_APP") // IN_APP | EMAIL
+  status            String    @default("PENDING") // PENDING | SENT | FAILED | CANCELLED
+  sentAt            DateTime? @map("sent_at")
+  attemptCount      Int       @default(0) @map("attempt_count")
+  lastError         String?   @map("last_error")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  workspace       Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  recipientMember WorkspaceMember? @relation(fields: [recipientMemberId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+  inboxItem       ChangeInboxItem? @relation(fields: [inboxItemId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+  task            Task?            @relation(fields: [taskId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+  // Reminder.target-exactly-one CHECK 는 raw SQL constraint (Prisma 표현 불가):
+  //   reminder_target_exactly_one_check: XOR(inbox_item_id, task_id)
+
+  @@index([status, remindAt])
+  @@index([workspaceId, status])
+  @@map("reminder")
+}
+
+model DomainOutbox {
+  id            String    @id @default(cuid())
+  eventType     String    @map("event_type") // LEGAL_CHANGE_PUBLISHED 등
+  aggregateType String    @map("aggregate_type")
+  aggregateId   String    @map("aggregate_id")
+  dedupeKey     String    @unique @map("dedupe_key")
+  payload       Json
+  status        String    @default("PENDING") // PENDING | PROCESSING | DONE | FAILED | DEAD
+  attemptCount  Int       @default(0) @map("attempt_count")
+  nextRunAt     DateTime  @default(now()) @map("next_run_at")
+  lockedAt      DateTime? @map("locked_at")
+  lockedBy      String?   @map("locked_by")
+  lastError     String?   @map("last_error")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  processedAt   DateTime? @map("processed_at")
+
+  @@index([status, nextRunAt])
+  @@index([eventType, createdAt(sort: Desc)])
+  @@map("domain_outbox")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// F. Operations (기존 유지)
+// ═══════════════════════════════════════════════════════════════
+
+model CollectorRun {
+  id                  String    @id @default(cuid())
+  jobType             String    @map("job_type")
+  status              String
+  startedAt           DateTime  @default(now()) @map("started_at")
+  finishedAt          DateTime? @map("finished_at")
+  scannedCount        Int       @default(0) @map("scanned_count")
+  newCount            Int       @default(0) @map("new_count")
+  changedCount        Int       @default(0) @map("changed_count")
+  successCount        Int       @default(0) @map("success_count")
+  failCount           Int       @default(0) @map("fail_count")
+  staleRecoveredCount Int       @default(0) @map("stale_recovered_count")
+  errorMessage        String?   @map("error_message")
+  metadata            Json?
+
+  @@index([jobType, startedAt(sort: Desc)])
+  @@index([status, startedAt(sort: Desc)])
+  @@map("collector_run")
+}
+
+model CollectorJob {
+  id           String    @id @default(cuid())
+  jobType      String    @map("job_type")
+  sourceType   String    @map("source_type") // LAW | ADMIN_RULE (LegalSource와 대응)
+  sourceId     String    @map("source_id") // externalDocumentId
+  status       String    @default("PENDING")
+  attemptCount Int       @default(0) @map("attempt_count")
+  nextRunAt    DateTime  @default(now()) @map("next_run_at")
+  lockedAt     DateTime? @map("locked_at")
+  lockedBy     String?   @map("locked_by")
+  startedAt    DateTime? @map("started_at")
+  finishedAt   DateTime? @map("finished_at")
+  lastError    String?   @map("last_error")
+  payload      Json?
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  @@index([status, nextRunAt])
+  @@index([status, lockedAt])
+  @@index([sourceType, sourceId])
+  @@map("collector_job")
+}
+
+model BootstrapProgress {
+  id                 String    @id @default(cuid())
+  sourceType         String    @map("source_type")
+  scope              String    @default("all")
+  cursorPage         Int       @default(1) @map("cursor_page")
+  totalCount         Int       @default(0) @map("total_count")
+  rawScannedCount    Int       @default(0) @map("raw_scanned_count")
+  matchedCount       Int       @default(0) @map("matched_count")
+  enqueuedCount      Int       @default(0) @map("enqueued_count")
+  alreadyActiveCount Int       @default(0) @map("already_active_count")
+  status             String    @default("RUNNING")
+  startedAt          DateTime  @default(now()) @map("started_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
+  finishedAt         DateTime? @map("finished_at")
+  lastError          String?   @map("last_error")
+  lockedAt           DateTime? @map("locked_at")
+  lockedBy           String?   @map("locked_by")
+  heartbeatAt        DateTime? @map("heartbeat_at")
+
+  @@unique([sourceType, scope])
+  @@index([status, updatedAt(sort: Desc)])
+  @@index([status, heartbeatAt])
+  @@map("bootstrap_progress")
+}
+
+model ReconciliationProgress {
+  id           String    @id @default(cuid())
+  sourceType   String    @map("source_type")
+  sessionId    String    @map("session_id")
+  cursorPage   Int       @default(1) @map("cursor_page")
+  totalCount   Int       @default(0) @map("total_count")
+  scannedCount Int       @default(0) @map("scanned_count")
+  status       String    @default("RUNNING")
+  startedAt    DateTime  @default(now()) @map("started_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+  finishedAt   DateTime? @map("finished_at")
+  lastError    String?   @map("last_error")
+  lockedAt     DateTime? @map("locked_at")
+  lockedBy     String?   @map("locked_by")
+  heartbeatAt  DateTime? @map("heartbeat_at")
+
+  snapshots ReconciliationSourceSnapshot[]
+
+  @@unique([sourceType, sessionId])
+  @@index([sourceType, status, startedAt(sort: Desc)])
+  @@map("reconciliation_progress")
+}
+
+model ReconciliationSourceSnapshot {
+  id               String @id @default(cuid())
+  reconciliationId String @map("reconciliation_id")
+  sourceId         String @map("source_id")
+
+  session ReconciliationProgress @relation(fields: [reconciliationId], references: [id], onDelete: Cascade)
+
+  @@unique([reconciliationId, sourceId])
+  @@index([reconciliationId])
+  @@map("reconciliation_source_snapshot")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// G. Audit
+// ═══════════════════════════════════════════════════════════════
+
+model AdminAuditLog {
+  id           String   @id @default(cuid())
+  actorUserId  String?  @map("actor_user_id")
+  actor        String // legacy label (예: "admin")
+  action       String
+  targetType   String?  @map("target_type")
+  targetId     String?  @map("target_id")
+  target       String? // legacy free-text
+  beforeStatus String?  @map("before_status")
+  afterStatus  String?  @map("after_status")
+  payload      Json?
+  outcome      String   @default("success")
+  errorMessage String?  @map("error_message")
+  ipHash       String?  @map("ip_hash")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  actorUser AppUser? @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt(sort: Desc)])
+  @@index([action, createdAt(sort: Desc)])
+  @@map("admin_audit_log")
+}
+
+// ────────────────────────────────────────────────────────────────
+// H. Regulatory relations & topics (골격 — 자동 분류 X, 사용자 매핑)
+// ────────────────────────────────────────────────────────────────
+model LegalDocumentRelation {
+  id             String   @id @default(cuid())
+  fromDocumentId String   @map("from_document_id")
+  toDocumentId   String   @map("to_document_id")
+  relationType   String   @map("relation_type") // IMPLEMENTS | DELEGATED_RULE | RELATED | AMENDS
+  source         String? // MANUAL | AUTO
+  confidence     Float?
+  metadata       Json?
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  fromDocument LegalDocument @relation("RelationFrom", fields: [fromDocumentId], references: [id], onDelete: Cascade)
+  toDocument   LegalDocument @relation("RelationTo", fields: [toDocumentId], references: [id], onDelete: Cascade)
+
+  @@unique([fromDocumentId, toDocumentId, relationType])
+  @@index([toDocumentId, relationType])
+  @@map("legal_document_relation")
+}
+
+model RegulatoryTopic {
+  id          String  @id @default(cuid())
+  code        String  @unique // PRIVACY | AML | LABOR ...
+  name        String
+  description String?
+  parentId    String? @map("parent_id")
+  status      String  @default("ACTIVE")
+
+  parent    RegulatoryTopic?  @relation("TopicTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children  RegulatoryTopic[] @relation("TopicTree")
+  documents DocumentTopic[]
+
+  @@index([status])
+  @@map("regulatory_topic")
+}
+
+model DocumentTopic {
+  documentId String   @map("document_id")
+  topicId    String   @map("topic_id")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  document LegalDocument   @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  topic    RegulatoryTopic @relation(fields: [topicId], references: [id], onDelete: Cascade)
+
+  @@id([documentId, topicId])
+  @@index([topicId])
+  @@map("document_topic")
+}
+
+// ────────────────────────────────────────────────────────────────
+// I. Internal Policy — 사내 사규·지침·SOP 연결 (편집기 없이 링크만)
+// ────────────────────────────────────────────────────────────────
+model InternalPolicy {
+  id                String    @id @default(cuid())
+  workspaceId       String    @map("workspace_id")
+  type              String // REGULATION | GUIDELINE | MANUAL | SOP | TERMS | PRIVACY_POLICY | CONTRACT_TEMPLATE | SAFETY_PROCEDURE | OTHER
+  title             String
+  status            String    @default("ACTIVE") // ACTIVE | ARCHIVED
+  ownerDepartmentId String?   @map("owner_department_id")
+  externalUrl       String?   @map("external_url")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+  archivedAt        DateTime? @map("archived_at")
+
+  workspace       Workspace               @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  ownerDepartment Department?             @relation("PolicyOwnerDept", fields: [ownerDepartmentId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+  versions        InternalPolicyVersion[]
+  mappings        LegalPolicyMapping[]
+
+  @@unique([id, workspaceId], map: "internal_policy_id_workspace_unique")
+  @@index([workspaceId, status])
+  @@index([workspaceId, type])
+  @@map("internal_policy")
+}
+
+model InternalPolicyVersion {
+  id                String    @id @default(cuid())
+  workspaceId       String    @map("workspace_id") // denormalized for composite FK
+  policyId          String    @map("policy_id")
+  versionLabel      String?   @map("version_label")
+  effectiveDate     DateTime? @map("effective_date")
+  /** 사규 본문. 근거 법령을 자동으로 뽑으려면 본문이 있어야 한다.
+   *  사규는 "「근로기준법」 제53조에 따라" 처럼 근거를 문언으로 인용한다 —
+   *  해석례에서 인용 147개 중 143개(97%)를 맞춘 방식을 그대로 쓴다. */
+  contentText       String?   @map("content_text") @db.Text
+  contentHash       String?   @map("content_hash")
+  externalUrl       String?   @map("external_url")
+  createdByMemberId String?   @map("created_by_member_id")
+  createdAt         DateTime  @default(now()) @map("created_at")
+
+  policy          InternalPolicy   @relation(fields: [policyId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+  createdByMember WorkspaceMember? @relation("PolicyVersionCreator", fields: [createdByMemberId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+
+  @@index([policyId, effectiveDate(sort: Desc)])
+  @@index([workspaceId], map: "internal_policy_version_workspace_id_idx")
+  @@map("internal_policy_version")
+}
+
+model LegalPolicyMapping {
+  id                String   @id @default(cuid())
+  workspaceId       String   @map("workspace_id")
+  documentId        String   @map("document_id")
+  contentUnitId     String?  @map("content_unit_id")
+  policyId          String   @map("policy_id")
+  createdByMemberId String?  @map("created_by_member_id") // v12: nullable — historical retention
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  workspace       Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  document        LegalDocument     @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  contentUnit     LegalContentUnit? @relation(fields: [contentUnitId, documentId], references: [id, documentId], onDelete: SetNull)
+  policy          InternalPolicy    @relation(fields: [policyId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+  createdByMember WorkspaceMember?  @relation(fields: [createdByMemberId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+
+  @@unique([workspaceId, documentId, contentUnitId, policyId])
+  @@index([policyId])
+  @@index([documentId])
+  @@map("legal_policy_mapping")
+}
+
+model WorkspaceAuditLog {
+  id            String   @id @default(cuid())
+  workspaceId   String   @map("workspace_id")
+  actorMemberId String?  @map("actor_member_id")
+  action        String
+  entityType    String   @map("entity_type")
+  entityId      String   @map("entity_id")
+  beforeData    Json?    @map("before_data")
+  afterData     Json?    @map("after_data")
+  metadata      Json?
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  workspace   Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  actorMember WorkspaceMember? @relation("AuditActor", fields: [actorMemberId, workspaceId], references: [id, workspaceId], onDelete: SetNull)
+
+  @@index([workspaceId, createdAt(sort: Desc)])
+  @@index([workspaceId, entityType, entityId])
+  @@map("workspace_audit_log")
+}
+
+// ────────── 법령해석례 (법제처 expc) ──────────
+// 법령이 아니라 "이 조문이 이런 뜻이다" 라는 유권해석 문서다. 판·개정 이력이
+// 없고 확정된 한 건이므로 LegalDocument 계열과 섞지 않는다.
+//
+// 실측(2026-09-01, 전수 8,823건):
+//   법령해석례일련번호 중복 0 · 안건번호 중복 0 · 안건명 빈 값 0
+//   회신일자 빈 값 92건(1.0%) · 이유 본문 중앙 2,923자
+//   전체 목록을 89회 호출 17초에 훑는다 — 증분에 날짜 창이 필요 없다.
+model LegalInterpretation {
+  id                String    @id @default(cuid())
+  /**
+   * 법령해석례일련번호. 전수 8,823건에서 중복 0 확인.
+   */
+  externalId        String    @map("external_id")
+  /**
+   * 안건번호. 이것도 전수 중복 0 이라 대조용으로 둔다.
+   */
+  caseNumber        String?   @map("case_number")
+  title             String
+  question          String?   @db.Text
+  answer            String?   @db.Text
+  reasoning         String?   @db.Text
+  /**
+   * 해석일자. 6% 가 비어 있다.
+   */
+  interpretedAt     DateTime? @map("interpreted_at") @db.Date
+  /**
+   * 등록일시. 해석일자와 최대 12년까지 벌어진다 — 지연 등록이 실재한다.
+   */
+  registeredAt      DateTime? @map("registered_at") @db.Date
+  replyAgencyName   String?   @map("reply_agency_name")
+  replyAgencyCode   String?   @map("reply_agency_code")
+  inquiryAgencyName String?   @map("inquiry_agency_name")
+  inquiryAgencyCode String?   @map("inquiry_agency_code")
+  officialUrl       String?   @map("official_url")
+  /**
+   * 제목+질의+회답+이유의 SHA-256. 수정 여부 판정에 쓴다.
+   */
+  contentHash       String    @map("content_hash")
+  collectedAt       DateTime  @default(now()) @map("collected_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  laws LegalInterpretationLaw[]
+
+  @@unique([externalId])
+  @@index([interpretedAt])
+  @@index([registeredAt])
+  @@map("legal_interpretation")
+}
+
+// 해석례가 인용한 법령. 법제처 문서는 법령명을 「」 로 감싸므로 결정론적으로
+// 뽑을 수 있다. 실측: 표본 60건 전부 인용이 있었고 인용 147개 중 143개(97%)가
+// 우리 법령과 매칭됐다. 실패 4개는 가운뎃점 문자 차이(ㆍ U+318D vs · U+00B7)
+// 뿐이라 정규화하면 사라진다. AI 없이 되는 연결이다.
+model LegalInterpretationLaw {
+  id               String @id @default(cuid())
+  interpretationId String @map("interpretation_id")
+  documentId       String @map("document_id")
+  /**
+   * 원문에 적힌 그대로의 법령명. 매칭 근거를 남긴다.
+   */
+  citedTitle       String @map("cited_title")
+
+  interpretation LegalInterpretation @relation(fields: [interpretationId], references: [id], onDelete: Cascade)
+  document       LegalDocument       @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@unique([interpretationId, documentId])
+  @@index([documentId])
+  @@map("legal_interpretation_law")
+}
+
+// ────────── 행정기관 결정문 (개인정보위 ppc · 공정위 ftc) ──────────
+// 두 소스는 구조가 거의 같다 — 목록에 결정문일련번호, 상세에 주문·이유·
+// 결정요지. 표가 다른 필드는 rawFields 에 담고 공통만 컬럼으로 둔다.
+//
+// 실측(2026-09-01):
+//   ppc 4,127건 · ftc 8,254건 · 양쪽 결정문일련번호 중복 0
+//   전수 스캔 8초 / 18초 — expc 와 같이 날짜 창 없이 전수를 훑으면 된다
+//   ftc: 이유 중앙 3,229자 · 본문이 사실상 없는 건 2%
+//   ppc: 이유 중앙 30자 · 본문이 사실상 없는 건 51% (본문이 이미지 별지에 있다)
+model AgencyDecision {
+  id           String    @id @default(cuid())
+  /**
+   * PPC(개인정보보호위원회) | FTC(공정거래위원회)
+   */
+  source       String
+  /**
+   * 결정문일련번호. 소스 안에서 유일함을 전수로 확인했다.
+   */
+  externalId   String    @map("external_id")
+  /**
+   * 안건번호(ppc) / 사건번호(ftc)
+   */
+  caseNumber   String?   @map("case_number")
+  title        String
+  /**
+   * 결정일자(ftc) / 의결일자(ppc). ppc 6.2% · ftc 0.7% 가 빈 값이다.
+   */
+  decidedAt    DateTime? @map("decided_at") @db.Date
+  /**
+   * 주문 — 무엇을 하라고 정했는지.
+   */
+  disposition  String?   @db.Text
+  /**
+   * 결정요지
+   */
+  summary      String?   @db.Text
+  reasoning    String?   @db.Text
+  meetingType  String?   @map("meeting_type")
+  decisionType String?   @map("decision_type")
+  officialUrl  String?   @map("official_url")
+  /**
+   * 소스마다 다른 나머지 필드. 스키마를 미리 못 박지 않는다.
+   */
+  rawFields    Json?     @map("raw_fields")
+  contentHash  String    @map("content_hash")
+  collectedAt  DateTime  @default(now()) @map("collected_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  laws AgencyDecisionLaw[]
+
+  @@unique([source, externalId])
+  @@index([source, decidedAt])
+  @@map("agency_decision")
+}
+
+model AgencyDecisionLaw {
+  id         String @id @default(cuid())
+  decisionId String @map("decision_id")
+  documentId String @map("document_id")
+  citedTitle String @map("cited_title")
+
+  decision AgencyDecision @relation(fields: [decisionId], references: [id], onDelete: Cascade)
+  document LegalDocument  @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@unique([decisionId, documentId])
+  @@index([documentId])
+  @@map("agency_decision_law")
+}

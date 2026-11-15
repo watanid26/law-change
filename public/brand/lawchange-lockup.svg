@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 236 40" fill="none">
+  <g transform="translate(0 2)" stroke="currentColor" stroke-width="1.6">
+    <rect x="3" y="3" width="7" height="7"/><rect x="13" y="3" width="7" height="7"/><rect x="23" y="3" width="7" height="7"/>
+    <rect x="3" y="13" width="7" height="7"/><rect x="13" y="13" width="7" height="7" fill="currentColor"/><rect x="23" y="13" width="7" height="7"/>
+    <rect x="3" y="23" width="7" height="7"/><rect x="13" y="23" width="7" height="7"/><rect x="23" y="23" width="7" height="7"/>
+  </g>
+  <text x="45" y="29" fill="currentColor" font-family="Pretendard, Inter, Arial, sans-serif" font-size="26" font-weight="650" letter-spacing="-0.7">LawChange</text>
+</svg>
